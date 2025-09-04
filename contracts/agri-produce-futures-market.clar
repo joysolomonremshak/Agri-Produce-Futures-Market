@@ -8,6 +8,8 @@
 (define-constant ERR_ALREADY_EXISTS (err u106))
 (define-constant ERR_INVALID_QUANTITY (err u107))
 (define-constant ERR_INVALID_PRICE (err u108))
+(define-constant ERR_NO_PENDING_AMENDMENT (err u109))
+(define-constant ERR_AMENDMENT_PENDING (err u110))
 
 (define-data-var next-contract-id uint u1)
 
@@ -33,6 +35,20 @@
     farmer-deposited: uint,
     buyer-deposited: uint,
     total-locked: uint
+  }
+)
+
+(define-map contract-amendments
+  uint
+  {
+    proposed-by: principal,
+    quantity: (optional uint),
+    price-per-unit: (optional uint),
+    delivery-date: (optional uint),
+    farmer-deposit: (optional uint),
+    buyer-deposit: (optional uint),
+    proposed-at: uint,
+    status: (string-ascii 20)
   }
 )
 
@@ -93,6 +109,7 @@
     (asserts! (is-eq tx-sender (get farmer contract-data)) ERR_NOT_AUTHORIZED)
     (asserts! (is-eq (get status contract-data) "OPEN") ERR_INVALID_STATUS)
     (asserts! (is-eq (get farmer-deposited deposit-data) u0) ERR_ALREADY_EXISTS)
+    (asserts! (is-none (map-get? contract-amendments contract-id)) ERR_AMENDMENT_PENDING)
     
     (try! (stx-transfer? required-deposit tx-sender (as-contract tx-sender)))
     
@@ -127,6 +144,7 @@
     (asserts! (is-eq tx-sender (get buyer contract-data)) ERR_NOT_AUTHORIZED)
     (asserts! (is-eq (get status contract-data) "OPEN") ERR_INVALID_STATUS)
     (asserts! (is-eq (get buyer-deposited deposit-data) u0) ERR_ALREADY_EXISTS)
+    (asserts! (is-none (map-get? contract-amendments contract-id)) ERR_AMENDMENT_PENDING)
     
     (try! (stx-transfer? required-deposit tx-sender (as-contract tx-sender)))
     
@@ -205,6 +223,106 @@
   )
 )
 
+(define-public (propose-amendment 
+  (contract-id uint)
+  (new-quantity (optional uint))
+  (new-price-per-unit (optional uint))
+  (new-delivery-date (optional uint))
+  (new-farmer-deposit (optional uint))
+  (new-buyer-deposit (optional uint)))
+  (let
+    (
+      (contract-data (unwrap! (map-get? contracts contract-id) ERR_CONTRACT_NOT_FOUND))
+    )
+    (asserts! (or 
+                (is-eq tx-sender (get farmer contract-data))
+                (is-eq tx-sender (get buyer contract-data))) ERR_NOT_AUTHORIZED)
+    (asserts! (is-eq (get status contract-data) "OPEN") ERR_INVALID_STATUS)
+    (asserts! (is-none (map-get? contract-amendments contract-id)) ERR_AMENDMENT_PENDING)
+    
+    (if (is-some new-quantity)
+      (asserts! (> (unwrap-panic new-quantity) u0) ERR_INVALID_QUANTITY)
+      true)
+    (if (is-some new-price-per-unit)
+      (asserts! (> (unwrap-panic new-price-per-unit) u0) ERR_INVALID_PRICE)
+      true)
+    (if (is-some new-delivery-date)
+      (asserts! (> (unwrap-panic new-delivery-date) stacks-block-height) ERR_CONTRACT_EXPIRED)
+      true)
+    
+    (map-set contract-amendments contract-id
+      {
+        proposed-by: tx-sender,
+        quantity: new-quantity,
+        price-per-unit: new-price-per-unit,
+        delivery-date: new-delivery-date,
+        farmer-deposit: new-farmer-deposit,
+        buyer-deposit: new-buyer-deposit,
+        proposed-at: stacks-block-height,
+        status: "PENDING"
+      }
+    )
+    (ok "AMENDMENT_PROPOSED")
+  )
+)
+
+(define-public (accept-amendment (contract-id uint))
+  (let
+    (
+      (contract-data (unwrap! (map-get? contracts contract-id) ERR_CONTRACT_NOT_FOUND))
+      (amendment-data (unwrap! (map-get? contract-amendments contract-id) ERR_NO_PENDING_AMENDMENT))
+    )
+    (asserts! (or 
+                (is-eq tx-sender (get farmer contract-data))
+                (is-eq tx-sender (get buyer contract-data))) ERR_NOT_AUTHORIZED)
+    (asserts! (not (is-eq tx-sender (get proposed-by amendment-data))) ERR_NOT_AUTHORIZED)
+    (asserts! (is-eq (get status amendment-data) "PENDING") ERR_INVALID_STATUS)
+    
+    (let
+      (
+        (updated-quantity (default-to (get quantity contract-data) (get quantity amendment-data)))
+        (updated-price (default-to (get price-per-unit contract-data) (get price-per-unit amendment-data)))
+        (updated-delivery (default-to (get delivery-date contract-data) (get delivery-date amendment-data)))
+        (updated-farmer-deposit (default-to (get farmer-deposit contract-data) (get farmer-deposit amendment-data)))
+        (updated-buyer-deposit (default-to (get buyer-deposit contract-data) (get buyer-deposit amendment-data)))
+        (total-value (* updated-quantity updated-price))
+      )
+      (asserts! (>= updated-farmer-deposit (/ total-value u10)) ERR_INSUFFICIENT_DEPOSIT)
+      (asserts! (>= updated-buyer-deposit (/ total-value u10)) ERR_INSUFFICIENT_DEPOSIT)
+      
+      (map-set contracts contract-id
+        (merge contract-data {
+          quantity: updated-quantity,
+          price-per-unit: updated-price,
+          delivery-date: updated-delivery,
+          farmer-deposit: updated-farmer-deposit,
+          buyer-deposit: updated-buyer-deposit
+        })
+      )
+      
+      (map-delete contract-amendments contract-id)
+      (ok "AMENDMENT_ACCEPTED")
+    )
+  )
+)
+
+(define-public (reject-amendment (contract-id uint))
+  (let
+    (
+      (contract-data (unwrap! (map-get? contracts contract-id) ERR_CONTRACT_NOT_FOUND))
+      (amendment-data (unwrap! (map-get? contract-amendments contract-id) ERR_NO_PENDING_AMENDMENT))
+    )
+    (asserts! (or 
+                (is-eq tx-sender (get farmer contract-data))
+                (is-eq tx-sender (get buyer contract-data))) ERR_NOT_AUTHORIZED)
+    (asserts! (not (is-eq tx-sender (get proposed-by amendment-data))) ERR_NOT_AUTHORIZED)
+    (asserts! (is-eq (get status amendment-data) "PENDING") ERR_INVALID_STATUS)
+    
+    (map-delete contract-amendments contract-id)
+    (ok "AMENDMENT_REJECTED")
+  )
+)
+
 (define-read-only (get-contract (contract-id uint))
   (map-get? contracts contract-id)
 )
@@ -236,4 +354,8 @@
     contract-data (get status contract-data)
     "NOT_FOUND"
   )
+)
+
+(define-read-only (get-contract-amendment (contract-id uint))
+  (map-get? contract-amendments contract-id)
 )
