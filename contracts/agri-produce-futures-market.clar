@@ -10,8 +10,13 @@
 (define-constant ERR_INVALID_PRICE (err u108))
 (define-constant ERR_NO_PENDING_AMENDMENT (err u109))
 (define-constant ERR_AMENDMENT_PENDING (err u110))
+(define-constant ERR_DISPUTE_EXISTS (err u111))
+(define-constant ERR_NO_DISPUTE (err u112))
+(define-constant ERR_DISPUTE_RESOLVED (err u113))
+(define-constant ERR_NOT_ARBITER (err u114))
 
 (define-data-var next-contract-id uint u1)
+(define-data-var arbiter-address principal CONTRACT_OWNER)
 
 (define-map contracts
   uint
@@ -49,6 +54,21 @@
     buyer-deposit: (optional uint),
     proposed-at: uint,
     status: (string-ascii 20)
+  }
+)
+
+(define-map contract-disputes
+  uint
+  {
+    raised-by: principal,
+    reason: (string-ascii 200),
+    farmer-claim: uint,
+    buyer-claim: uint,
+    raised-at: uint,
+    resolved: bool,
+    resolution: (optional (string-ascii 200)),
+    farmer-payout: (optional uint),
+    buyer-payout: (optional uint)
   }
 )
 
@@ -358,4 +378,128 @@
 
 (define-read-only (get-contract-amendment (contract-id uint))
   (map-get? contract-amendments contract-id)
+)
+
+(define-public (set-arbiter (new-arbiter principal))
+  (begin
+    (asserts! (is-eq tx-sender CONTRACT_OWNER) ERR_NOT_AUTHORIZED)
+    (var-set arbiter-address new-arbiter)
+    (ok new-arbiter)
+  )
+)
+
+(define-public (raise-dispute 
+  (contract-id uint)
+  (reason (string-ascii 200))
+  (claimed-quantity uint))
+  (let
+    (
+      (contract-data (unwrap! (map-get? contracts contract-id) ERR_CONTRACT_NOT_FOUND))
+      (deposit-data (unwrap! (map-get? contract-deposits contract-id) ERR_CONTRACT_NOT_FOUND))
+      (is-farmer (is-eq tx-sender (get farmer contract-data)))
+      (is-buyer (is-eq tx-sender (get buyer contract-data)))
+      (farmer-claim (if is-farmer claimed-quantity u0))
+      (buyer-claim (if is-buyer claimed-quantity u0))
+    )
+    (asserts! (or is-farmer is-buyer) ERR_NOT_AUTHORIZED)
+    (asserts! (is-eq (get status contract-data) "ACTIVE") ERR_INVALID_STATUS)
+    (asserts! (is-none (map-get? contract-disputes contract-id)) ERR_DISPUTE_EXISTS)
+    (asserts! (<= claimed-quantity (get quantity contract-data)) ERR_INVALID_QUANTITY)
+    
+    (map-set contract-disputes contract-id
+      {
+        raised-by: tx-sender,
+        reason: reason,
+        farmer-claim: farmer-claim,
+        buyer-claim: buyer-claim,
+        raised-at: stacks-block-height,
+        resolved: false,
+        resolution: none,
+        farmer-payout: none,
+        buyer-payout: none
+      }
+    )
+    
+    (map-set contracts contract-id
+      (merge contract-data { status: "DISPUTED" }))
+    
+    (ok "DISPUTE_RAISED")
+  )
+)
+
+(define-public (submit-counter-claim 
+  (contract-id uint)
+  (counter-quantity uint))
+  (let
+    (
+      (contract-data (unwrap! (map-get? contracts contract-id) ERR_CONTRACT_NOT_FOUND))
+      (dispute-data (unwrap! (map-get? contract-disputes contract-id) ERR_NO_DISPUTE))
+      (is-farmer (is-eq tx-sender (get farmer contract-data)))
+      (is-buyer (is-eq tx-sender (get buyer contract-data)))
+    )
+    (asserts! (or is-farmer is-buyer) ERR_NOT_AUTHORIZED)
+    (asserts! (not (is-eq tx-sender (get raised-by dispute-data))) ERR_NOT_AUTHORIZED)
+    (asserts! (not (get resolved dispute-data)) ERR_DISPUTE_RESOLVED)
+    (asserts! (<= counter-quantity (get quantity contract-data)) ERR_INVALID_QUANTITY)
+    
+    (let
+      (
+        (updated-farmer-claim (if is-farmer counter-quantity (get farmer-claim dispute-data)))
+        (updated-buyer-claim (if is-buyer counter-quantity (get buyer-claim dispute-data)))
+      )
+      (map-set contract-disputes contract-id
+        (merge dispute-data {
+          farmer-claim: updated-farmer-claim,
+          buyer-claim: updated-buyer-claim
+        })
+      )
+      (ok "COUNTER_CLAIM_SUBMITTED")
+    )
+  )
+)
+
+(define-public (resolve-dispute 
+  (contract-id uint)
+  (resolution (string-ascii 200))
+  (awarded-quantity uint))
+  (let
+    (
+      (contract-data (unwrap! (map-get? contracts contract-id) ERR_CONTRACT_NOT_FOUND))
+      (dispute-data (unwrap! (map-get? contract-disputes contract-id) ERR_NO_DISPUTE))
+      (deposit-data (unwrap! (map-get? contract-deposits contract-id) ERR_CONTRACT_NOT_FOUND))
+      (delivered-value (* awarded-quantity (get price-per-unit contract-data)))
+      (farmer-payout (+ (get farmer-deposited deposit-data) delivered-value))
+      (buyer-refund (- (get total-locked deposit-data) farmer-payout))
+    )
+    (asserts! (is-eq tx-sender (var-get arbiter-address)) ERR_NOT_ARBITER)
+    (asserts! (is-eq (get status contract-data) "DISPUTED") ERR_INVALID_STATUS)
+    (asserts! (not (get resolved dispute-data)) ERR_DISPUTE_RESOLVED)
+    (asserts! (<= awarded-quantity (get quantity contract-data)) ERR_INVALID_QUANTITY)
+    
+    (as-contract (try! (stx-transfer? farmer-payout tx-sender (get farmer contract-data))))
+    (as-contract (try! (stx-transfer? buyer-refund tx-sender (get buyer contract-data))))
+    
+    (map-set contract-disputes contract-id
+      (merge dispute-data {
+        resolved: true,
+        resolution: (some resolution),
+        farmer-payout: (some farmer-payout),
+        buyer-payout: (some buyer-refund)
+      })
+    )
+    
+    (map-set contracts contract-id
+      (merge contract-data { status: "RESOLVED" }))
+    
+    (map-delete contract-deposits contract-id)
+    (ok awarded-quantity)
+  )
+)
+
+(define-read-only (get-dispute (contract-id uint))
+  (map-get? contract-disputes contract-id)
+)
+
+(define-read-only (get-arbiter)
+  (var-get arbiter-address)
 )
